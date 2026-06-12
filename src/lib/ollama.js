@@ -1,17 +1,40 @@
 const OLLAMA_BASE = 'http://localhost:11434'
-const MODEL = 'qwen2.5-coder:7b'
+const MODEL_OLLAMA = 'qwen2.5-coder:7b'
+const MODEL_GEMINI = 'gemini-2.0-flash'
+const GEMINI_KEY = import.meta.env.VITE_GEMINI_KEY
 
-export async function ollamaChat(messages, onChunk = null) {
+// Détecte si on est en prod Vercel ou en local
+const isVercel = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
+
+async function geminiChat(messages) {
+  const systemMsg = messages.find(m => m.role === 'system')
+  const userMsgs = messages.filter(m => m.role !== 'system')
+
+  const contents = userMsgs.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }))
+
+  const body = {
+    contents,
+    systemInstruction: systemMsg ? { parts: [{ text: systemMsg.content }] } : undefined,
+    generationConfig: { maxOutputTokens: 1024, temperature: 0.7 }
+  }
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_GEMINI}:generateContent?key=${GEMINI_KEY}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+  )
+  const data = await res.json()
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+}
+
+async function ollamaChat_internal(messages, onChunk) {
   const response = await fetch(`${OLLAMA_BASE}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      stream: !!onChunk
-    })
+    body: JSON.stringify({ model: MODEL_OLLAMA, messages, stream: !!onChunk })
   })
-
   if (!response.ok) throw new Error(`Ollama error: ${response.status}`)
 
   if (onChunk) {
@@ -39,6 +62,28 @@ export async function ollamaChat(messages, onChunk = null) {
   }
 }
 
+export async function ollamaChat(messages, onChunk = null) {
+  if (isVercel || !GEMINI_KEY === false) {
+    // Sur Vercel ou si clé Gemini dispo → Gemini
+    if (GEMINI_KEY) {
+      const result = await geminiChat(messages)
+      if (onChunk) onChunk(result, result)
+      return result
+    }
+  }
+  // En local → Ollama avec fallback Gemini
+  try {
+    return await ollamaChat_internal(messages, onChunk)
+  } catch {
+    if (GEMINI_KEY) {
+      const result = await geminiChat(messages)
+      if (onChunk) onChunk(result, result)
+      return result
+    }
+    throw new Error('Ollama non disponible et pas de clé Gemini configurée')
+  }
+}
+
 export async function analyzeAuditResponses(referential, responses, domainScores) {
   const lowDomains = Object.entries(domainScores)
     .filter(([, score]) => score < 60)
@@ -50,7 +95,7 @@ export async function analyzeAuditResponses(referential, responses, domainScores
     .map(([id]) => id)
     .join(', ')
 
-  const prompt = `Tu es un expert en cybersécurité et conformité GRC. 
+  const prompt = `Tu es un expert en cybersécurité et conformité GRC.
 Analyse les résultats d'un audit ${referential.name}.
 
 DOMAINES FAIBLES (score < 60%): ${lowDomains || 'Aucun'}
